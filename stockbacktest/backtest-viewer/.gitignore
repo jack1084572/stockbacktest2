@@ -1,0 +1,3 @@
+!stockbacktest/
+!stockbacktest/**
+!.gitignore
