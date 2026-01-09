@@ -1,15 +1,16 @@
 # =========================================================
 # Imports
 # =========================================================
+import os
+import json
+import numpy as np
 import pandas as pd
 import backtrader as bt
-import json
-from dateutil.relativedelta import relativedelta
-from datetime import time
-import pytz
+import yfinance as yf
+from datetime import timedelta
 
 # =========================================================
-# Strategy: EMA + Recovery + Reverse Add-on + NYSE Time Limit
+# Strategy: EMA Compare + Recovery Scaling
 # =========================================================
 class EMAStrategy(bt.Strategy):
     params = dict(
@@ -20,45 +21,41 @@ class EMAStrategy(bt.Strategy):
         take_profit_cash=300,
         recovery_mult=2,
         max_capital_pct=0.9,
-        ny_open=time(9,30),
-        ny_close=time(16,0),
     )
 
     def __init__(self):
         self.ema_fast = bt.ind.EMA(self.data.close, period=self.p.fast_period)
         self.ema_slow = bt.ind.EMA(self.data.close, period=self.p.slow_period)
+
         self.trade_log = []
         self.equity_curve = []
-        self._entry = None
+
         self.in_recovery = False
         self.recovery_shares = self.p.initial_shares
-        self.last_trade_direction = None
-        self.ny_tz = pytz.timezone("America/New_York")  # 纽约时区
+
+        self._prev_pos = 0
+        self._entry = None
 
     def check_capital(self, shares):
         price = self.data.close[0]
         return abs(price * shares) <= self.broker.getvalue() * self.p.max_capital_pct
 
-    def is_nyse_open(self):
-        dt = self.data.datetime.datetime(0).replace(tzinfo=pytz.UTC).astimezone(self.ny_tz)
-        return self.p.ny_open <= dt.time() <= self.p.ny_close
-
     def next(self):
-        # 每根K线都记录账户净值
         self.equity_curve.append(round(self.broker.getvalue(), 2))
-
-        # 非交易时间直接跳过
-        if not self.is_nyse_open():
-            return
 
         fast = self.ema_fast[0]
         slow = self.ema_slow[0]
         price = self.data.close[0]
 
-        # =========================
-        # 持仓止损/止盈
-        # =========================
-        if self.position:
+        if not self.position:
+            shares = self.recovery_shares if self.in_recovery else self.p.initial_shares
+            if not self.check_capital(shares):
+                return
+            if fast > slow:
+                self.buy(size=shares)
+            elif fast < slow:
+                self.sell(size=shares)
+        else:
             entry_price = self.position.price
             shares = abs(self.position.size)
             pnl = (
@@ -70,113 +67,113 @@ class EMAStrategy(bt.Strategy):
             if pnl <= -self.p.stop_loss_cash * scale or pnl >= self.p.take_profit_cash * scale:
                 self.close()
 
-        # =========================
-        # 反向加仓循环
-        # =========================
-        if self.in_recovery and not self.position and self.last_trade_direction:
-            shares = self.recovery_shares
-            if self.last_trade_direction == "LONG" and self.check_capital(shares):
-                self.sell(size=shares)
-            elif self.last_trade_direction == "SHORT" and self.check_capital(shares):
-                self.buy(size=shares)
-
-        # =========================
-        # 正常 EMA 策略开仓
-        # =========================
-        if not self.position and not self.in_recovery:
-            shares = self.p.initial_shares
-            if not self.check_capital(shares):
-                return
-            if fast > slow:
-                self.buy(size=shares)
-            elif fast < slow:
-                self.sell(size=shares)
-
     def notify_order(self, order):
         if order.status in [order.Submitted, order.Accepted]:
             return
-        if order.status != order.Completed:
-            return
 
-        # 平仓也只在交易时间生效
-        dt = bt.num2date(order.executed.dt)
-        dt_ny = dt.replace(tzinfo=pytz.UTC).astimezone(self.ny_tz)
-        if not self.p.ny_open <= dt_ny.time() <= self.p.ny_close:
-            return
+        if order.status == order.Completed:
+            new_pos = self.position.size
+            prev_pos = self._prev_pos
+            price = order.executed.price
+            dt = bt.num2date(order.executed.dt).strftime("%Y-%m-%d %H:%M")
 
-        price = order.executed.price
-        size = order.executed.size
-        direction = "LONG" if size > 0 else "SHORT"
-        dt_str = dt_ny.strftime("%Y-%m-%d %H:%M")
-
-        # 开仓/加仓记录
-        if self.position.size != 0:
-            if self._entry is None:
+            if prev_pos == 0 and new_pos != 0:
                 self._entry = {
-                    "Entry Date": dt_str,
-                    "Direction": direction,
-                    "Shares": abs(size),
+                    "Entry Date": dt,
+                    "Direction": "LONG" if new_pos > 0 else "SHORT",
+                    "Shares": abs(new_pos),
                     "Entry Price": round(price, 2),
                 }
-            else:
-                prev_qty = self._entry["Shares"]
-                prev_price = self._entry["Entry Price"]
-                new_qty = abs(size)
-                weighted_price = (prev_price * prev_qty + price * new_qty) / (prev_qty + new_qty)
-                self._entry["Shares"] += new_qty
-                self._entry["Entry Price"] = round(weighted_price, 2)
 
-        # 平仓记录
-        if self.position.size == 0 and self._entry:
-            qty = self._entry["Shares"]
-            pnl = (
-                (price - self._entry["Entry Price"]) * qty
-                if self._entry["Direction"] == "LONG"
-                else (self._entry["Entry Price"] - price) * qty
-            )
+            elif prev_pos != 0 and new_pos == 0 and self._entry:
+                qty = self._entry["Shares"]
+                pnl = (
+                    (price - self._entry["Entry Price"]) * qty
+                    if self._entry["Direction"] == "LONG"
+                    else (self._entry["Entry Price"] - price) * qty
+                )
 
-            if pnl < 0:
-                self.in_recovery = True
-                self.recovery_shares = self._entry["Shares"] * self.p.recovery_mult
-            else:
-                self.in_recovery = False
-                self.recovery_shares = self.p.initial_shares
+                if pnl < 0:
+                    self.in_recovery = True
+                    self.recovery_shares *= self.p.recovery_mult
+                else:
+                    self.in_recovery = False
+                    self.recovery_shares = self.p.initial_shares
 
-            self.last_trade_direction = self._entry["Direction"]
+                self.trade_log.append({
+                    "Entry Date": self._entry["Entry Date"],
+                    "Exit Date": dt,
+                    "Direction": self._entry["Direction"],
+                    "Shares": qty,
+                    "Entry Price": self._entry["Entry Price"],
+                    "Exit Price": round(price, 2),
+                    "PnL ($)": round(pnl, 2),
+                    "Equity After Close": round(self.broker.getvalue(), 2),
+                })
+                self._entry = None
 
-            self.trade_log.append({
-                "Entry Date": self._entry["Entry Date"],
-                "Exit Date": dt_str,
-                "Direction": self._entry["Direction"],
-                "Shares": qty,
-                "Entry Price": self._entry["Entry Price"],
-                "Exit Price": round(price, 2),
-                "PnL ($)": round(pnl, 2),
-                "Equity After Close": round(self.broker.getvalue(), 2),
+            self._prev_pos = new_pos
+
+# =========================================================
+# Data Utilities
+# =========================================================
+def generate_random_30m_from_daily(daily_df, out_csv):
+    rows = []
+    for date, row in daily_df.iterrows():
+        o, h, l, c = row["open"], row["high"], row["low"], row["close"]
+        base = np.linspace(o, c, 13)
+        noise = np.random.normal(0, (h - l) * 0.05, size=13)
+        prices = base + noise
+        t = pd.Timestamp(date)
+        for i in range(13):
+            rows.append({
+                "datetime": t,
+                "open": prices[i],
+                "high": prices[i] + abs(noise[i]),
+                "low": prices[i] - abs(noise[i]),
+                "close": prices[i],
+                "volume": row["volume"] / 13,
+                "openinterest": 0,
             })
+            t += timedelta(minutes=30)
 
-            self._entry = None
+    df30 = pd.DataFrame(rows).set_index("datetime")
+    df30.to_csv(out_csv)
+    return df30
 
-# =========================================================
-# CSV Loader
-# =========================================================
-def load_m30_csv(file_path, months=None):
-    df = pd.read_csv(file_path, sep="\t")
-    df['datetime'] = pd.to_datetime(df['<DATE>'] + ' ' + df['<TIME>'])
-    df = df.set_index('datetime')
-    df = df.rename(columns={
-        '<OPEN>': 'open',
-        '<HIGH>': 'high',
-        '<LOW>': 'low',
-        '<CLOSE>': 'close',
-        '<TICKVOL>': 'volume',
-        '<VOL>': 'openinterest'
-    })
-    df = df[['open','high','low','close','volume','openinterest']]
-    if months:
-        start_date = df.index[-1] - relativedelta(months=months)
-        df = df[df.index >= start_date]
-    return df
+def prepare_data(symbol, months=120):
+    """
+    1. 检查是否存在日线 CSV，如果没有下载
+    2. 截取最近 months 月数据生成30分钟 CSV
+    3. 返回30分钟 DataFrame
+    """
+    daily_csv = f"{symbol}_1d.csv"
+    m30_csv = f"{symbol}_30m.csv"
+
+    # 下载日线数据
+    if not os.path.exists(daily_csv):
+        print(f"Downloading full daily data for {symbol}...")
+        df = yf.download(symbol, period="max", interval="1d", auto_adjust=True, progress=False)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        df = df.rename(columns=str.lower)
+        df["openinterest"] = 0
+        df.to_csv(daily_csv)
+        print(f"Saved daily CSV: {daily_csv}")
+    else:
+        df = pd.read_csv(daily_csv, index_col=0, parse_dates=True)
+
+    # 截取最近 months 月数据
+    last_date = df.index.max()
+    start_date = last_date - pd.DateOffset(months=months)
+    df_recent = df[df.index >= start_date]
+
+    # 生成30分钟 CSV
+    print(f"Generating 30m data from last {months} months...")
+    df30 = generate_random_30m_from_daily(df_recent, m30_csv)
+    print(f"Saved 30m CSV: {m30_csv}")
+
+    return df30[["open", "high", "low", "close", "volume", "openinterest"]]
 
 # =========================================================
 # HTML Report
@@ -274,20 +271,19 @@ new Chart(document.getElementById("equityChart"), {{
 </body>
 </html>
 """
+
     filename = f"{symbol}_Backtest_Report.html"
     with open(filename, "w", encoding="utf-8") as f:
         f.write(html)
     print(f"HTML report generated: {filename}")
 
 # =========================================================
-# Run
+# Main
 # =========================================================
 def run():
-    symbol = "SOXL"
-    file_path = "SOXL_M30_202507091630_202601081630.csv"
-    months_to_backtest = 6  # 最近 N 个月回测
+    symbol = "BITX"
+    df = prepare_data(symbol, months=3)  # <-- 最近120个月(10年)的日线生成30分钟CSV
 
-    df = load_m30_csv(file_path, months=months_to_backtest)
     data = bt.feeds.PandasData(dataname=df)
 
     cerebro = bt.Cerebro()
@@ -297,8 +293,8 @@ def run():
         fast_period=9,
         slow_period=21,
         initial_shares=100,
-        stop_loss_cash=500,
-        take_profit_cash=500,
+        stop_loss_cash=300,
+        take_profit_cash=300,
         recovery_mult=2,
     )
 
@@ -310,6 +306,7 @@ def run():
 
     pd.DataFrame(strat.trade_log).to_csv(f"{symbol}_trades.csv", index=False)
     generate_html(symbol, params, strat.equity_curve, strat.trade_log)
+
     print("Backtest finished")
 
 if __name__ == "__main__":
