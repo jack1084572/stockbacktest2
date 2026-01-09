@@ -5,8 +5,8 @@ import pandas as pd
 import backtrader as bt
 import json
 from dateutil.relativedelta import relativedelta
-from datetime import time
 import pytz
+from datetime import time
 
 # =========================================================
 # Strategy: EMA + Recovery + Reverse Add-on + NYSE Time Limit
@@ -33,14 +33,17 @@ class EMAStrategy(bt.Strategy):
         self.in_recovery = False
         self.recovery_shares = self.p.initial_shares
         self.last_trade_direction = None
-        self.ny_tz = pytz.timezone("America/New_York")  # 纽约时区
+        self.ny_tz = pytz.timezone("US/Eastern")  # 纽约时区
 
     def check_capital(self, shares):
         price = self.data.close[0]
         return abs(price * shares) <= self.broker.getvalue() * self.p.max_capital_pct
 
     def is_nyse_open(self):
-        dt = self.data.datetime.datetime(0).replace(tzinfo=pytz.UTC).astimezone(self.ny_tz)
+        dt = self.data.datetime.datetime(0)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=pytz.UTC)
+        dt = dt.astimezone(self.ny_tz)
         return self.p.ny_open <= dt.time() <= self.p.ny_close
 
     def next(self):
@@ -98,16 +101,21 @@ class EMAStrategy(bt.Strategy):
         if order.status != order.Completed:
             return
 
-        # 平仓也只在交易时间生效
-        dt = bt.num2date(order.executed.dt)
-        dt_ny = dt.replace(tzinfo=pytz.UTC).astimezone(self.ny_tz)
-        if not self.p.ny_open <= dt_ny.time() <= self.p.ny_close:
-            return
-
         price = order.executed.price
         size = order.executed.size
         direction = "LONG" if size > 0 else "SHORT"
-        dt_str = dt_ny.strftime("%Y-%m-%d %H:%M")
+
+        dt = bt.num2date(order.executed.dt)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=pytz.UTC)
+        dt = dt.astimezone(self.ny_tz)
+        dt_str = dt.strftime("%Y-%m-%d %H:%M")
+
+        # =========================
+        # 只在 NYSE 交易时段记录
+        # =========================
+        if not (self.p.ny_open <= dt.time() <= self.p.ny_close):
+            return
 
         # 开仓/加仓记录
         if self.position.size != 0:
@@ -163,6 +171,8 @@ class EMAStrategy(bt.Strategy):
 def load_m30_csv(file_path, months=None):
     df = pd.read_csv(file_path, sep="\t")
     df['datetime'] = pd.to_datetime(df['<DATE>'] + ' ' + df['<TIME>'])
+    # 假设 CSV 原始时间是 UTC
+    df['datetime'] = df['datetime'].dt.tz_localize('UTC').dt.tz_convert('US/Eastern')
     df = df.set_index('datetime')
     df = df.rename(columns={
         '<OPEN>': 'open',
@@ -284,7 +294,7 @@ new Chart(document.getElementById("equityChart"), {{
 # =========================================================
 def run():
     symbol = "SOXL"
-    file_path = "SOXL_M30_202507091630_202601081630.csv"
+    file_path = "BITX_M30_202306271630_202601072230.csv"
     months_to_backtest = 6  # 最近 N 个月回测
 
     df = load_m30_csv(file_path, months=months_to_backtest)
